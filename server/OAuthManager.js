@@ -237,7 +237,7 @@ class OAuthManager {
   isAuthenticated() {
     const store = this.loadTokens();
     return !!(store && store.accounts && store.accounts.length > 0 &&
-      store.accounts.some(a => a.access_token && a.refresh_token));
+      store.accounts.some(a => a.access_token));
   }
 
   getTokenExpiration() {
@@ -254,8 +254,9 @@ class OAuthManager {
     return store.accounts.map(function(a, i) {
       return {
         id: a.id,
+        label: a.label || null,
         active: i === (store.active_index || 0),
-        authenticated: !!(a.access_token && a.refresh_token),
+        authenticated: !!a.access_token,
         expires_at: a.expires_at ? new Date(a.expires_at).toISOString() : null,
         expired: a.expires_at ? a.expires_at <= now : true,
         exhausted: !!(a.exhausted_until && a.exhausted_until > now),
@@ -263,6 +264,21 @@ class OAuthManager {
           ? new Date(a.exhausted_until).toISOString() : null
       };
     });
+  }
+
+  updateAccount(accountId, updates) {
+    const store = this.loadTokens();
+    if (!store) return false;
+    const account = store.accounts.find(a => a.id === accountId);
+    if (!account) return false;
+    // Only allow safe fields to be updated
+    const safeFields = ['label'];
+    for (const key of safeFields) {
+      if (updates[key] !== undefined) account[key] = updates[key];
+    }
+    this._writeTokens(store);
+    Logger.info('Updated account ' + accountId + ': ' + JSON.stringify(updates));
+    return true;
   }
 
   removeAccount(accountId) {

@@ -186,6 +186,21 @@ async function handleRequest(req, res) {
     return;
   }
 
+
+  if (pathname === '/auth/accounts' && req.method === 'PATCH') {
+    try {
+      const accountId = parsedUrl.query.id;
+      if (!accountId) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Missing id parameter' })); return; }
+      const body = await parseBody(req);
+      const updated = OAuthManager.updateAccount(accountId, body);
+      if (updated) { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ success: true, message: 'Updated ' + accountId })); }
+      else { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Account ' + accountId + ' not found' })); }
+    } catch (error) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: error.message }));
+    }
+    return;
+  }
   if (pathname === '/auth/logout' && req.method === 'GET') {
     try {
       OAuthManager.logout();
@@ -242,7 +257,7 @@ function startServer() {
       Logger.info('  ' + accounts.length + ' account(s) authenticated');
       accounts.forEach(function(a) {
         const status = a.exhausted ? 'exhausted' : a.expired ? 'expired' : 'active';
-        Logger.info('    ' + a.id + ': ' + status + (a.active ? ' (current)' : ''));
+        var labelStr = a.label ? ' (' + a.label + ')' : ''; Logger.info('    ' + a.id + labelStr + ': ' + status + (a.active ? ' (current)' : ''));
       });
     } else {
       Logger.info('  Not authenticated');
