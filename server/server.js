@@ -6,10 +6,10 @@ const ClaudeRequest = require('./ClaudeRequest');
 const Logger = require('./Logger');
 const OAuthManager = require('./OAuthManager');
 const { exec } = require('child_process');
-const { routeRequest } = require('./router');
-const registry = require('./backends/registry');
-const AnthropicBackend = require('./backends/anthropic');
-const GeminiBackend = require('./backends/gemini');
+const Router = require('./router');
+
+let router;
+let registry;
 
 let config = {};
 const startTime = Date.now();
@@ -48,6 +48,10 @@ function loadConfig() {
 }
 
 function initBackends() {
+  router = new Router(config);
+  registry = router.registry;
+  Logger.info("Router initialized");
+  return;
   const anthropic = new AnthropicBackend({
     enabled: config.backend_anthropic_enabled !== 'false',
     priority: parseInt(config.backend_anthropic_priority) || 1,
@@ -282,7 +286,7 @@ async function handleRequest(req, res) {
       const presetMatch = pathname.match(/^\/v1\/(\w+)\/messages$/);
       if (presetMatch) { presetName = presetMatch[1]; Logger.debug('Detected preset: ' + presetName); }
 
-      await routeRequest(req, res, body, presetName);
+      await router.handleRequest(req, res, body, presetName);
     } catch (error) {
       Logger.error('Request error:', error.message);
       if (!res.headersSent) {
