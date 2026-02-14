@@ -5,12 +5,12 @@ filter_sampling_params=false
 auto_open_browser=false
 fallback_to_claude_code=false
 
-# Backend: Anthropic (Claude Code proxy)
+# Backend: Anthropic (Claude Code subscription)
 backend_anthropic_enabled=true
 backend_anthropic_priority=1
-backend_anthropic_models=claude-sonnet-4-20250514,claude-opus-4-20250514,claude-haiku-4-5-20250514
+backend_anthropic_models=claude-opus-4-6,claude-opus-4-5,claude-sonnet-4-5,claude-sonnet-4-20250514,claude-opus-4-20250514,claude-haiku-4-5,claude-haiku-4-5-20251001,claude-3-5-haiku-20241022
 
-# Backend: Gemini (CodeAssist free tier)
+# Backend: Gemini (Code Assist OAuth - Google One AI Pro)
 backend_gemini_enabled=true
 backend_gemini_priority=2
 backend_gemini_models=gemini-2.5-pro,gemini-2.5-flash

@@ -51,27 +51,6 @@ function initBackends() {
   router = new Router(config);
   registry = router.registry;
   Logger.info("Router initialized");
-  return;
-  const anthropic = new AnthropicBackend({
-    enabled: config.backend_anthropic_enabled !== 'false',
-    priority: parseInt(config.backend_anthropic_priority) || 1,
-    models: config.backend_anthropic_models
-      ? config.backend_anthropic_models.split(',').map(s => s.trim())
-      : undefined,
-  });
-  registry.register('anthropic', anthropic);
-
-  const gemini = new GeminiBackend({
-    enabled: config.backend_gemini_enabled !== 'false',
-    priority: parseInt(config.backend_gemini_priority) || 2,
-    models: config.backend_gemini_models
-      ? config.backend_gemini_models.split(',').map(s => s.trim())
-      : undefined,
-    disableSearch: config.backend_gemini_disable_search === 'true',
-  });
-  registry.register('gemini', gemini);
-
-  Logger.info('Backends initialized');
 }
 
 function parseBody(req) {
