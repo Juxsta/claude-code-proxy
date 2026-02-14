@@ -6,8 +6,13 @@ const ClaudeRequest = require('./ClaudeRequest');
 const Logger = require('./Logger');
 const OAuthManager = require('./OAuthManager');
 const { exec } = require('child_process');
+const { routeRequest } = require('./router');
+const registry = require('./backends/registry');
+const AnthropicBackend = require('./backends/anthropic');
+const GeminiBackend = require('./backends/gemini');
 
 let config = {};
+const startTime = Date.now();
 
 const pkceStates = new Map();
 const PKCE_EXPIRY_MS = 10 * 60 * 1000;
@@ -40,6 +45,29 @@ function loadConfig() {
     Logger.error('Failed to load config:', error.message);
     process.exit(1);
   }
+}
+
+function initBackends() {
+  const anthropic = new AnthropicBackend({
+    enabled: config.backend_anthropic_enabled !== 'false',
+    priority: parseInt(config.backend_anthropic_priority) || 1,
+    models: config.backend_anthropic_models
+      ? config.backend_anthropic_models.split(',').map(s => s.trim())
+      : undefined,
+  });
+  registry.register('anthropic', anthropic);
+
+  const gemini = new GeminiBackend({
+    enabled: config.backend_gemini_enabled !== 'false',
+    priority: parseInt(config.backend_gemini_priority) || 2,
+    models: config.backend_gemini_models
+      ? config.backend_gemini_models.split(',').map(s => s.trim())
+      : undefined,
+    disableSearch: config.backend_gemini_disable_search === 'true',
+  });
+  registry.register('gemini', gemini);
+
+  Logger.info('Backends initialized');
 }
 
 function parseBody(req) {
@@ -129,7 +157,6 @@ async function handleRequest(req, res) {
       if (!pkceData) throw new Error('Invalid or expired state parameter. Please start the authorization process again.');
       pkceStates.delete(state);
       const tokens = await OAuthManager.exchangeCodeForTokens(code, pkceData.code_verifier, state);
-      // Append as new account (does NOT overwrite existing accounts)
       const tokenData = {
         access_token: tokens.access_token,
         refresh_token: tokens.refresh_token,
@@ -148,10 +175,16 @@ async function handleRequest(req, res) {
 
   if (pathname === '/auth/status' && req.method === 'GET') {
     try {
-      const isAuthenticated = OAuthManager.isAuthenticated();
+      const anthropicAuth = OAuthManager.isAuthenticated();
       const accounts = OAuthManager.getAccountsStatus();
+      const geminiBackend = registry.getBackend('gemini');
+      const geminiAuth = geminiBackend ? geminiBackend.isHealthy() : false;
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ authenticated: isAuthenticated, total_accounts: accounts.length, accounts: accounts }));
+      res.end(JSON.stringify({
+        authenticated: anthropicAuth || geminiAuth,
+        anthropic: { authenticated: anthropicAuth, total_accounts: accounts.length, accounts },
+        gemini: { authenticated: geminiAuth },
+      }));
     } catch (error) {
       Logger.error('Auth status error:', error.message);
       res.writeHead(500, { 'Content-Type': 'application/json' });
@@ -186,7 +219,6 @@ async function handleRequest(req, res) {
     return;
   }
 
-
   if (pathname === '/auth/accounts' && req.method === 'PATCH') {
     try {
       const accountId = parsedUrl.query.id;
@@ -201,6 +233,7 @@ async function handleRequest(req, res) {
     }
     return;
   }
+
   if (pathname === '/auth/logout' && req.method === 'GET') {
     try {
       OAuthManager.logout();
@@ -220,19 +253,42 @@ async function handleRequest(req, res) {
     return;
   }
 
+  if (pathname === '/status' && req.method === 'GET') {
+    try {
+      const backends = registry.getAllBackends();
+      const counts = registry.getRequestCounts();
+      const def = registry.getDefaultBackend();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        status: 'ok',
+        uptime_seconds: Math.floor((Date.now() - startTime) / 1000),
+        default_backend: def ? def.name : null,
+        backends,
+        request_counts: counts,
+      }));
+    } catch (error) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: error.message }));
+    }
+    return;
+  }
+
   if (req.method === 'POST' && (pathname === '/v1/messages' || pathname.match(/^\/v1\/\w+\/messages$/))) {
     try {
       Logger.debug('Incoming request headers:', JSON.stringify(req.headers, null, 2));
       const body = await parseBody(req);
-      Logger.debug('Claude request body (' + JSON.stringify(body).length + ' bytes):', JSON.stringify(body, null, 2));
+      Logger.debug('Request body (' + JSON.stringify(body).length + ' bytes):', JSON.stringify(body, null, 2));
       let presetName = null;
       const presetMatch = pathname.match(/^\/v1\/(\w+)\/messages$/);
       if (presetMatch) { presetName = presetMatch[1]; Logger.debug('Detected preset: ' + presetName); }
-      await new ClaudeRequest(req).handleResponse(res, body, presetName);
+
+      await routeRequest(req, res, body, presetName);
     } catch (error) {
       Logger.error('Request error:', error.message);
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: error.message }));
+      if (!res.headersSent) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: error.message }));
+      }
     }
     return;
   }
@@ -243,6 +299,7 @@ async function handleRequest(req, res) {
 
 function startServer() {
   loadConfig();
+  initBackends();
   const server = http.createServer(handleRequest);
   const port = parseInt(config.port) || 3000;
   const host = config.host || (isRunningInDocker() ? '0.0.0.0' : '127.0.0.1');
@@ -254,13 +311,13 @@ function startServer() {
     Logger.info('');
     Logger.info('Authentication Status:');
     if (isAuthenticated && accounts.length > 0) {
-      Logger.info('  ' + accounts.length + ' account(s) authenticated');
+      Logger.info('  Anthropic: ' + accounts.length + ' account(s) authenticated');
       accounts.forEach(function(a) {
         const status = a.exhausted ? 'exhausted' : a.expired ? 'expired' : 'active';
         var labelStr = a.label ? ' (' + a.label + ')' : ''; Logger.info('    ' + a.id + labelStr + ': ' + status + (a.active ? ' (current)' : ''));
       });
     } else {
-      Logger.info('  Not authenticated');
+      Logger.info('  Anthropic: Not authenticated');
       const authUrl = 'http://localhost:' + port + '/auth/login';
       Logger.info('  Visit ' + authUrl + ' to authenticate');
       const autoOpenBrowser = config.auto_open_browser !== 'false';
@@ -268,6 +325,14 @@ function startServer() {
         Logger.info('  Opening browser for authentication...');
         setTimeout(function() { openBrowser(authUrl); }, 1000);
       }
+    }
+    const geminiBackend = registry.getBackend('gemini');
+    Logger.info('  Gemini: ' + (geminiBackend && geminiBackend.isHealthy() ? 'authenticated' : 'not configured'));
+    Logger.info('');
+    Logger.info('Backends:');
+    const allBackends = registry.getAllBackends();
+    for (const [name, info] of Object.entries(allBackends)) {
+      Logger.info('  ' + name + ': enabled=' + info.enabled + ' priority=' + info.priority + ' healthy=' + info.healthy);
     }
     Logger.info('');
   });
