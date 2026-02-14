@@ -5,13 +5,13 @@ filter_sampling_params=false
 auto_open_browser=false
 fallback_to_claude_code=false
 
-# Backend: Anthropic
+# Backend: Anthropic (Claude Code proxy)
 backend_anthropic_enabled=true
 backend_anthropic_priority=1
 backend_anthropic_models=claude-sonnet-4-20250514,claude-opus-4-20250514,claude-haiku-4-5-20250514
 
-# Backend: Gemini
-backend_gemini_enabled=true
+# Backend: Gemini (CodeAssist free tier)
+backend_gemini_enabled=false
 backend_gemini_priority=2
 backend_gemini_models=gemini-2.5-pro,gemini-2.5-flash
 backend_gemini_disable_search=false

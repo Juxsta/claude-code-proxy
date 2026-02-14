@@ -1,119 +1,130 @@
-const Logger = require('./Logger');
-const registry = require('./backends/registry');
+var Logger = require('./Logger');
+var BackendRegistry = require('./backends/registry').BackendRegistry;
+var AnthropicBackend = require('./backends/anthropic');
+var GeminiBackend = require('./backends/gemini');
 
-const MODEL_ALIASES = {
-  'auto': null, // resolved dynamically
-  'sonnet': 'claude-sonnet-4-20250514',
-  'opus': 'claude-opus-4-20250514',
-  'haiku': 'claude-haiku-4-5-20250514',
-  'gemini': 'gemini-2.5-pro',
-  'flash': 'gemini-2.5-flash',
+var MODEL_ALIASES = {
+  auto: null,
+  sonnet: 'claude-sonnet-4-20250514',
+  opus: 'claude-opus-4-20250514',
+  haiku: 'claude-haiku-4-5-20250514',
+  gemini: 'gemini-2.5-pro',
+  flash: 'gemini-2.5-flash',
 };
 
-const RETRYABLE_STATUS = new Set([403, 429, 503, 529]);
+class Router {
+  constructor(config) {
+    this.registry = new BackendRegistry();
+    this.config = config;
+    this.startTime = Date.now();
+    this._initBackends(config);
+  }
 
-function resolveModel(model) {
-  if (!model) return { resolved: null, isAuto: true };
-  const lower = model.toLowerCase();
-  if (lower === 'auto') return { resolved: null, isAuto: true };
-  if (MODEL_ALIASES[lower]) return { resolved: MODEL_ALIASES[lower], isAuto: false };
-  return { resolved: model, isAuto: false };
-}
+  _initBackends(config) {
+    if (config.backend_anthropic_enabled !== 'false') {
+      var anthropic = new AnthropicBackend({
+        priority: parseInt(config.backend_anthropic_priority) || 1,
+        models: config.backend_anthropic_models
+          ? config.backend_anthropic_models.split(',').map(function(s) { return s.trim(); })
+          : undefined,
+      });
+      this.registry.register('anthropic', anthropic);
+    }
 
-function detectBackendForModel(model) {
-  if (!model) return null;
-  if (model.startsWith('claude-') || model.startsWith('anthropic/')) return 'anthropic';
-  if (model.startsWith('gemini-') || model.startsWith('google/')) return 'gemini';
-  return null;
-}
+    if (config.backend_gemini_enabled === 'true') {
+      var gemini = new GeminiBackend({
+        priority: parseInt(config.backend_gemini_priority) || 2,
+        models: config.backend_gemini_models
+          ? config.backend_gemini_models.split(',').map(function(s) { return s.trim(); })
+          : undefined,
+        disableSearch: config.backend_gemini_disable_search === 'true',
+      });
+      this.registry.register('gemini', gemini);
+    }
+  }
 
-async function routeRequest(req, res, body, presetName) {
-  const originalModel = body.model;
-  const { resolved, isAuto } = resolveModel(originalModel);
+  resolveModel(model) {
+    if (!model) return { resolved: null, isAlias: false };
+    var lower = model.toLowerCase();
+    if (lower in MODEL_ALIASES) {
+      return { resolved: MODEL_ALIASES[lower], isAlias: true, alias: lower };
+    }
+    return { resolved: model, isAlias: false };
+  }
 
-  let model = resolved;
-  let backends = [];
+  async handleRequest(req, res, body, presetName) {
+    var resolveResult = this.resolveModel(body.model);
+    var model = resolveResult.resolved;
 
-  if (isAuto || !model) {
-    // Use highest-priority healthy backend's default model
-    const def = registry.getDefaultBackend();
-    if (!def) {
-      Logger.error('No healthy backends available');
+    if (resolveResult.isAlias) {
+      Logger.info('Model alias: ' + body.model + ' -> ' + (model || 'auto'));
+    }
+
+    var backends = this.registry.getAllBackendsForModel(model || 'auto');
+
+    if (backends.length === 0) {
       res.writeHead(503, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ type: 'error', error: { type: 'service_unavailable', message: 'All backends are unavailable' } }));
+      res.end(JSON.stringify({
+        type: 'error',
+        error: { type: 'api_error', message: 'No backends available for model: ' + (body.model || 'auto') },
+      }));
       return;
     }
-    backends = [def];
-    // Keep original model for the backend to handle, or use first model from backend
-    if (!model) model = def.backend.models[0];
-    body.model = model;
-    Logger.info('Auto-resolved to backend=' + def.name + ' model=' + model);
-  } else {
-    body.model = model;
-    // Find backends that support this model
-    backends = registry.getBackendsForModel(model);
 
-    if (backends.length === 0) {
-      // Try detecting backend by model name pattern
-      const backendName = detectBackendForModel(model);
-      if (backendName) {
-        const backend = registry.getBackend(backendName);
-        if (backend && backend.enabled) {
-          backends = [{ name: backendName, backend }];
+    var lastError = null;
+    for (var i = 0; i < backends.length; i++) {
+      var entry = backends[i];
+      var backend = entry.backend;
+
+      if (!backend.isHealthy()) {
+        Logger.debug('Skipping unhealthy backend: ' + entry.id);
+        continue;
+      }
+
+      try {
+        Logger.info('Routing to backend: ' + entry.id + ' (model: ' + (model || body.model || 'default') + ')');
+        this.registry.incrementRequestCount(entry.id);
+
+        if (entry.id === 'anthropic') {
+          await backend.sendRequest(req, res, body, presetName);
+        } else {
+          var backendBody = Object.assign({}, body);
+          if (model) backendBody.model = model;
+          await backend.sendRequest(req, res, backendBody, presetName);
         }
+
+        this.registry.markHealthy(entry.id);
+        return;
+      } catch (error) {
+        lastError = error;
+        Logger.warn('Backend ' + entry.id + ' failed: ' + error.message);
+        this.registry.markDegraded(entry.id, error.message);
       }
     }
 
-    if (backends.length === 0) {
-      Logger.error('No backend found for model: ' + model);
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'No backend available for model: ' + model } }));
-      return;
-    }
-  }
-
-  // Try each backend in priority order
-  for (let i = 0; i < backends.length; i++) {
-    const { name, backend } = backends[i];
-
-    if (!backend.isHealthy()) {
-      Logger.info('Skipping unhealthy backend: ' + name);
-      continue;
-    }
-
-    Logger.info('Routing to backend=' + name + ' model=' + model);
-    registry.incrementCount(name);
-
-    try {
-      const result = await backend.sendRequest(req, res, body, presetName);
-
-      // If backend returned an error status that's retryable, try next
-      if (result && result.statusCode && RETRYABLE_STATUS.has(result.statusCode) && i < backends.length - 1) {
-        Logger.warn('Backend ' + name + ' returned ' + result.statusCode + ', trying next backend');
-        continue;
-      }
-
-      return; // Success or non-retryable error
-    } catch (error) {
-      Logger.error('Backend ' + name + ' failed: ' + error.message);
-      if (i < backends.length - 1) {
-        Logger.info('Retrying with next backend...');
-        continue;
-      }
-      // Last backend failed
-      if (!res.headersSent) {
-        res.writeHead(502, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: 'Backend request failed: ' + error.message } }));
-      }
-      return;
+    if (!res.headersSent) {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        type: 'error',
+        error: {
+          type: 'api_error',
+          message: 'All backends failed. Last error: ' + (lastError ? lastError.message : 'unknown'),
+        },
+      }));
     }
   }
 
-  // All backends exhausted
-  if (!res.headersSent) {
-    res.writeHead(503, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ type: 'error', error: { type: 'service_unavailable', message: 'All backends are unavailable or returned errors' } }));
+  getStatus() {
+    var uptime = Date.now() - this.startTime;
+    var hours = Math.floor(uptime / 3600000);
+    var mins = Math.floor((uptime % 3600000) / 60000);
+
+    return {
+      backends: this.registry.getStatus(),
+      uptime: hours + 'h ' + mins + 'm',
+      uptimeMs: uptime,
+    };
   }
 }
 
-module.exports = { routeRequest, resolveModel, MODEL_ALIASES };
+module.exports = Router;

@@ -1,225 +1,380 @@
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const Logger = require('../Logger');
-const { anthropicToGemini, geminiToAnthropic, geminiStreamToAnthropicSSE } = require('../gemini/translator');
+const { translateRequest, translateResponse, StreamTranslator, mapModelToGemini } = require('../gemini/translator');
 
-const GEMINI_CREDS_PATH = path.join(
-  process.env.HOME || process.env.USERPROFILE,
-  '.gemini',
-  'oauth_creds.json'
-);
+const CODE_ASSIST_ENDPOINT = 'https://cloudcode-pa.googleapis.com';
+const CODE_ASSIST_API_VERSION = 'v1internal';
+const OAUTH_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || 'your-client-id';
+const OAUTH_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || 'your-client-secret';
 
-const TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
-// Gemini CLI client_id (public)
-const GEMINI_CLIENT_ID = '012559816023-eilk1a70rlaqufkfgkhiaag2vi1svore.apps.googleusercontent.com';
-const GEMINI_CLIENT_SECRET = '';
+const RATE_LIMIT_CODES = [429, 503];
+const AUTO_SWITCH_MAP = { 'gemini-2.5-pro': 'gemini-2.5-flash', 'gemini-2.5-flash': 'gemini-2.5-flash-lite' };
+const COOLDOWN_MS = 10 * 60 * 1000;
 
 class GeminiBackend {
   constructor(config) {
     this.type = 'gemini';
     this.priority = config.priority || 2;
-    this.models = config.models || [
-      'gemini-2.5-pro',
-      'gemini-2.5-flash',
-    ];
+    this.models = config.models || ['gemini-2.5-pro', 'gemini-2.5-flash'];
     this.enabled = config.enabled !== false;
     this.disableSearch = config.disableSearch || false;
-    this._cachedToken = null;
-    this._tokenExpiry = 0;
+
+    this.accessToken = null;
+    this.tokenExpiry = 0;
+    this.projectId = null;
+    this.credentials = null;
+    this.requestCount = 0;
+    this.modelCooldowns = {};
+
+    this._loadCredentials();
+  }
+
+  _loadCredentials() {
+    var credPath = path.join(process.env.HOME || process.env.USERPROFILE || '', '.gemini', 'oauth_creds.json');
+    try {
+      if (fs.existsSync(credPath)) {
+        this.credentials = JSON.parse(fs.readFileSync(credPath, 'utf8'));
+        Logger.info('Gemini credentials loaded from ' + credPath);
+      } else {
+        Logger.warn('Gemini credentials not found at ' + credPath);
+      }
+    } catch (e) {
+      Logger.error('Failed to load Gemini credentials: ' + e.message);
+    }
   }
 
   isHealthy() {
-    if (!this.enabled) return false;
-    try {
-      return fs.existsSync(GEMINI_CREDS_PATH);
-    } catch {
-      return false;
-    }
+    return this.enabled && !!this.credentials;
   }
 
-  async _getAccessToken() {
-    if (this._cachedToken && Date.now() < this._tokenExpiry - 30000) {
-      return this._cachedToken;
+  async _getAccessToken(forceRefresh) {
+    if (!forceRefresh && this.accessToken && Date.now() < this.tokenExpiry - 60000) {
+      return this.accessToken;
     }
 
-    const creds = JSON.parse(fs.readFileSync(GEMINI_CREDS_PATH, 'utf8'));
+    if (!this.credentials) throw new Error('No Gemini credentials');
 
-    // If token is still valid, use it
-    if (creds.access_token && creds.expires_at && Date.now() < creds.expires_at - 30000) {
-      this._cachedToken = creds.access_token;
-      this._tokenExpiry = creds.expires_at;
-      return creds.access_token;
-    }
+    var refreshToken = this.credentials.refresh_token;
+    if (!refreshToken) throw new Error('No refresh_token in Gemini credentials');
 
-    // Refresh
-    if (!creds.refresh_token) throw new Error('No Gemini refresh token available');
+    var formPayload = 'client_id=' + encodeURIComponent(OAUTH_CLIENT_ID) +
+      '&client_secret=' + encodeURIComponent(OAUTH_CLIENT_SECRET) +
+      '&refresh_token=' + encodeURIComponent(refreshToken) +
+      '&grant_type=refresh_token';
 
-    Logger.info('Refreshing Gemini OAuth token...');
-    const params = new URLSearchParams({
-      grant_type: 'refresh_token',
-      refresh_token: creds.refresh_token,
-      client_id: GEMINI_CLIENT_ID,
+    var tokenResponse = await this._httpsPostRaw('oauth2.googleapis.com', '/token', formPayload, {
+      'Content-Type': 'application/x-www-form-urlencoded',
     });
-    if (GEMINI_CLIENT_SECRET) params.append('client_secret', GEMINI_CLIENT_SECRET);
 
-    const response = await this._httpPost(TOKEN_ENDPOINT, params.toString(), 'application/x-www-form-urlencoded');
-    const tokens = JSON.parse(response);
+    if (tokenResponse.statusCode !== 200) {
+      throw new Error('Token refresh failed: ' + tokenResponse.body);
+    }
 
-    if (tokens.error) throw new Error('Gemini token refresh failed: ' + tokens.error);
-
-    this._cachedToken = tokens.access_token;
-    this._tokenExpiry = Date.now() + (tokens.expires_in * 1000);
-
-    // Save updated tokens
-    creds.access_token = tokens.access_token;
-    creds.expires_at = this._tokenExpiry;
-    if (tokens.refresh_token) creds.refresh_token = tokens.refresh_token;
-    fs.writeFileSync(GEMINI_CREDS_PATH, JSON.stringify(creds, null, 2));
-
-    Logger.info('Gemini token refreshed successfully');
-    return this._cachedToken;
+    var parsed = JSON.parse(tokenResponse.body);
+    this.accessToken = parsed.access_token;
+    this.tokenExpiry = Date.now() + (parsed.expires_in * 1000);
+    Logger.info('Gemini access token refreshed');
+    return this.accessToken;
   }
 
-  _httpPost(url, body, contentType) {
-    return new Promise((resolve, reject) => {
-      const parsed = new URL(url);
-      const req = https.request({
-        hostname: parsed.hostname,
-        path: parsed.pathname + parsed.search,
-        method: 'POST',
-        headers: { 'Content-Type': contentType }
-      }, (res) => {
-        let data = '';
-        res.on('data', c => data += c);
-        res.on('end', () => resolve(data));
+  async _discoverProjectId() {
+    if (this.projectId) return this.projectId;
+
+    var token = await this._getAccessToken();
+    var initialProject = 'default-project';
+
+    try {
+      var loadResp = await this._callEndpoint(token, 'loadCodeAssist', {
+        cloudaicompanionProject: initialProject,
+        metadata: { duetProject: initialProject },
+      });
+      var loadParsed = JSON.parse(loadResp.body);
+
+      if (loadParsed.cloudaicompanionProject) {
+        this.projectId = loadParsed.cloudaicompanionProject;
+        Logger.info('Gemini project discovered: ' + this.projectId);
+        return this.projectId;
+      }
+
+      var defaultTier = (loadParsed.allowedTiers || []).find(function(t) { return t.isDefault; });
+      var tierId = (defaultTier && defaultTier.id) || 'free-tier';
+
+      var retries = 0;
+      var lroResp;
+      while (retries < 30) {
+        lroResp = await this._callEndpoint(token, 'onboardUser', {
+          tierId: tierId,
+          cloudaicompanionProject: initialProject,
+        });
+        var lro = JSON.parse(lroResp.body);
+        if (lro.done) {
+          this.projectId = (lro.response && lro.response.cloudaicompanionProject && lro.response.cloudaicompanionProject.id) || initialProject;
+          Logger.info('Gemini project onboarded: ' + this.projectId);
+          return this.projectId;
+        }
+        await new Promise(function(r) { setTimeout(r, 1000); });
+        retries++;
+      }
+
+      this.projectId = initialProject;
+      return this.projectId;
+    } catch (e) {
+      Logger.error('Project discovery failed: ' + e.message);
+      this.projectId = 'default-project';
+      return this.projectId;
+    }
+  }
+
+  async _callEndpoint(token, method, body) {
+    var endpointUrl = CODE_ASSIST_ENDPOINT + '/' + CODE_ASSIST_API_VERSION + ':' + method;
+    var urlObj = new URL(endpointUrl);
+    return this._httpsPostRaw(urlObj.hostname, urlObj.pathname, JSON.stringify(body), {
+      'Content-Type': 'application/json',
+      'Authorization': 'Bearer ' + token,
+    });
+  }
+
+  _getBestModel(requestedModel) {
+    var model = mapModelToGemini(requestedModel);
+    var now = Date.now();
+    while (this.modelCooldowns[model] && this.modelCooldowns[model] > now) {
+      var fallback = AUTO_SWITCH_MAP[model];
+      if (!fallback) break;
+      Logger.info('Gemini model ' + model + ' in cooldown, falling back to ' + fallback);
+      model = fallback;
+    }
+    return model;
+  }
+
+  _markModelRateLimited(model) {
+    this.modelCooldowns[model] = Date.now() + COOLDOWN_MS;
+    Logger.warn('Gemini model ' + model + ' rate limited, cooldown for ' + (COOLDOWN_MS / 1000) + 's');
+  }
+
+  async sendRequest(req, res, body) {
+    try {
+      var token = await this._getAccessToken();
+      var projectId = await this._discoverProjectId();
+      var model = this._getBestModel(body.model);
+      var isStream = body.stream !== false;
+
+      var cleanBody = Object.assign({}, body);
+      delete cleanBody.stream;
+
+      var geminiPayload = translateRequest(cleanBody, projectId);
+      geminiPayload.model = model;
+
+      if (isStream) {
+        await this._handleStreaming(res, token, geminiPayload, model);
+      } else {
+        await this._handleNonStreaming(res, token, geminiPayload, model);
+      }
+
+      this.requestCount++;
+    } catch (error) {
+      Logger.error('Gemini request error: ' + error.message);
+      if (!res.headersSent) {
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+      }
+      if (!res.destroyed) {
+        res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: 'Gemini backend error: ' + error.message } }));
+      }
+    }
+  }
+
+  async _handleNonStreaming(res, token, geminiPayload, model) {
+    var endpointUrl = CODE_ASSIST_ENDPOINT + '/' + CODE_ASSIST_API_VERSION + ':generateContent';
+    var urlObj = new URL(endpointUrl);
+    var requestBody = JSON.stringify(geminiPayload.request);
+
+    var response = await this._httpsPostRaw(urlObj.hostname, urlObj.pathname, requestBody, {
+      'Content-Type': 'application/json',
+      'Authorization': 'Bearer ' + token,
+    });
+
+    if (response.statusCode === 401) {
+      var newToken = await this._getAccessToken(true);
+      response = await this._httpsPostRaw(urlObj.hostname, urlObj.pathname, requestBody, {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + newToken,
+      });
+    }
+
+    if (RATE_LIMIT_CODES.includes(response.statusCode)) {
+      this._markModelRateLimited(model);
+      var fallback = AUTO_SWITCH_MAP[model];
+      if (fallback) {
+        Logger.info('Rate limited on ' + model + ', retrying with ' + fallback);
+        geminiPayload.model = fallback;
+        return this._handleNonStreaming(res, token, geminiPayload, fallback);
+      }
+    }
+
+    if (response.statusCode !== 200) {
+      res.writeHead(response.statusCode >= 500 ? 502 : response.statusCode, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        type: 'error',
+        error: { type: 'api_error', message: 'Gemini API error: ' + response.statusCode + ' ' + response.body },
+      }));
+      return;
+    }
+
+    var geminiResponse = JSON.parse(response.body);
+    var anthropicResponse = translateResponse(geminiResponse, model);
+
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(anthropicResponse));
+  }
+
+  async _handleStreaming(res, token, geminiPayload, model) {
+    var endpointUrl = CODE_ASSIST_ENDPOINT + '/' + CODE_ASSIST_API_VERSION + ':streamGenerateContent?alt=sse';
+    var urlObj = new URL(endpointUrl);
+    var requestBody = JSON.stringify(geminiPayload.request);
+
+    var headers = {
+      'Content-Type': 'application/json',
+      'Authorization': 'Bearer ' + token,
+    };
+
+    var geminiRes = await this._httpsRequest(urlObj.hostname, urlObj.pathname + urlObj.search, requestBody, headers);
+
+    if (geminiRes.statusCode === 401) {
+      geminiRes.destroy();
+      var newToken = await this._getAccessToken(true);
+      headers['Authorization'] = 'Bearer ' + newToken;
+      var retryRes = await this._httpsRequest(urlObj.hostname, urlObj.pathname + urlObj.search, requestBody, headers);
+      return this._streamGeminiToAnthropic(res, retryRes, model);
+    }
+
+    if (RATE_LIMIT_CODES.includes(geminiRes.statusCode)) {
+      this._markModelRateLimited(model);
+      var fallback = AUTO_SWITCH_MAP[model];
+      if (fallback) {
+        geminiRes.destroy();
+        Logger.info('Rate limited streaming on ' + model + ', retrying with ' + fallback);
+        geminiPayload.model = fallback;
+        return this._handleStreaming(res, token, geminiPayload, fallback);
+      }
+    }
+
+    if (geminiRes.statusCode !== 200) {
+      var errorBody = '';
+      geminiRes.on('data', function(c) { errorBody += c; });
+      geminiRes.on('end', function() {
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'api_error', message: 'Gemini streaming error: ' + geminiRes.statusCode + ' ' + errorBody },
+        }));
+      });
+      return;
+    }
+
+    await this._streamGeminiToAnthropic(res, geminiRes, model);
+  }
+
+  _streamGeminiToAnthropic(res, geminiRes, model) {
+    return new Promise(function(resolve, reject) {
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+      });
+
+      var translator = new StreamTranslator(model);
+      var buffer = '';
+
+      var writeEvents = function(events) {
+        for (var evt of events) {
+          res.write('event: ' + evt.event + '\ndata: ' + JSON.stringify(evt.data) + '\n\n');
+        }
+      };
+
+      geminiRes.on('data', function(chunk) {
+        buffer += chunk.toString();
+        var lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (var line of lines) {
+          if (line.startsWith('data: ')) {
+            try {
+              var jsonStr = line.substring(6);
+              if (!jsonStr.trim()) continue;
+              var parsed = JSON.parse(jsonStr);
+              var data = parsed.response || parsed;
+              var events = translator.translateChunk(data);
+              writeEvents(events);
+            } catch (e) {
+              Logger.debug('Failed to parse Gemini SSE chunk: ' + e.message);
+            }
+          }
+        }
+      });
+
+      geminiRes.on('end', function() {
+        if (buffer.trim()) {
+          var lines = buffer.split('\n');
+          for (var line of lines) {
+            if (line.startsWith('data: ')) {
+              try {
+                var parsed = JSON.parse(line.substring(6));
+                var data = parsed.response || parsed;
+                writeEvents(translator.translateChunk(data));
+              } catch (e) { /* ignore */ }
+            }
+          }
+        }
+        writeEvents(translator.finalize());
+        res.end();
+        resolve();
+      });
+
+      geminiRes.on('error', function(err) {
+        Logger.error('Gemini stream error: ' + err.message);
+        if (!res.destroyed) res.end();
+        reject(err);
+      });
+
+      res.on('close', function() {
+        if (!geminiRes.destroyed) geminiRes.destroy();
+      });
+    });
+  }
+
+  // --- HTTP Helpers ---
+
+  _httpsPostRaw(hostname, pathname, body, headers) {
+    return new Promise(function(resolve, reject) {
+      var options = {
+        hostname: hostname, port: 443, path: pathname, method: 'POST',
+        headers: Object.assign({}, headers, { 'Content-Length': Buffer.byteLength(body) }),
+      };
+      var req = https.request(options, function(res) {
+        var data = '';
+        res.on('data', function(c) { data += c; });
+        res.on('end', function() { resolve({ statusCode: res.statusCode, headers: res.headers, body: data }); });
       });
       req.on('error', reject);
-      req.setTimeout(15000, () => { req.destroy(); reject(new Error('Request timeout')); });
+      req.setTimeout(30000, function() { req.destroy(); reject(new Error('Request timeout')); });
       req.write(body);
       req.end();
     });
   }
 
-  async sendRequest(req, res, body, presetName) {
-    const isStreaming = body.stream !== false;
-    const model = body.model || 'gemini-2.5-flash';
-
-    const accessToken = await this._getAccessToken();
-    const geminiBody = anthropicToGemini(body, { disableSearch: this.disableSearch });
-
-    const endpoint = isStreaming ? 'streamGenerateContent?alt=sse' : 'generateContent';
-    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:${endpoint}`;
-
-    Logger.debug('Gemini request to: ' + apiUrl);
-    Logger.debug('Gemini body: ' + JSON.stringify(geminiBody).substring(0, 500));
-
-    const parsed = new URL(apiUrl);
-    const options = {
-      hostname: parsed.hostname,
-      path: parsed.pathname + parsed.search,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer ' + accessToken,
-      }
-    };
-
-    return new Promise((resolve, reject) => {
-      const apiReq = https.request(options, (apiRes) => {
-        if (apiRes.statusCode >= 400) {
-          let errData = '';
-          apiRes.on('data', c => errData += c);
-          apiRes.on('end', () => {
-            Logger.error('Gemini API error ' + apiRes.statusCode + ': ' + errData.substring(0, 500));
-            // Return status to caller for retry logic
-            resolve({ statusCode: apiRes.statusCode, error: errData });
-          });
-          return;
-        }
-
-        if (isStreaming) {
-          this._handleStreamResponse(res, apiRes, model);
-        } else {
-          this._handleNonStreamResponse(res, apiRes, model);
-        }
-        resolve({ statusCode: apiRes.statusCode });
-      });
-
-      apiReq.on('error', (err) => {
-        Logger.error('Gemini request error: ' + err.message);
-        reject(err);
-      });
-      apiReq.setTimeout(120000, () => { apiReq.destroy(); reject(new Error('Gemini request timeout')); });
-      apiReq.write(JSON.stringify(geminiBody));
-      apiReq.end();
-    });
-  }
-
-  _handleStreamResponse(res, apiRes, model) {
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
-    });
-
-    const state = { started: false, model, contentIndex: 0, inText: false, inThinking: false };
-    let buffer = '';
-
-    apiRes.on('data', (chunk) => {
-      buffer += chunk.toString();
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
-
-      for (const line of lines) {
-        if (line.startsWith('data: ')) {
-          try {
-            const geminiChunk = JSON.parse(line.substring(6));
-            const sseOutput = geminiStreamToAnthropicSSE(geminiChunk, state);
-            if (sseOutput) res.write(sseOutput);
-          } catch (e) {
-            Logger.debug('Failed to parse Gemini SSE chunk: ' + e.message);
-          }
-        }
-      }
-    });
-
-    apiRes.on('end', () => {
-      // Process remaining buffer
-      if (buffer.startsWith('data: ')) {
-        try {
-          const geminiChunk = JSON.parse(buffer.substring(6));
-          const sseOutput = geminiStreamToAnthropicSSE(geminiChunk, state);
-          if (sseOutput) res.write(sseOutput);
-        } catch (e) { /* ignore */ }
-      }
-      res.end();
-    });
-
-    apiRes.on('error', (err) => {
-      Logger.error('Gemini stream error: ' + err.message);
-      if (!res.destroyed) res.end();
-    });
-
-    res.on('close', () => {
-      if (!apiRes.destroyed) apiRes.destroy();
-    });
-  }
-
-  _handleNonStreamResponse(res, apiRes, model) {
-    let data = '';
-    apiRes.on('data', c => data += c);
-    apiRes.on('end', () => {
-      try {
-        const geminiResponse = JSON.parse(data);
-        const anthropicResponse = geminiToAnthropic(geminiResponse, model);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(anthropicResponse));
-      } catch (e) {
-        Logger.error('Failed to translate Gemini response: ' + e.message);
-        res.writeHead(502, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Failed to process Gemini response' }));
-      }
+  _httpsRequest(hostname, pathname, body, headers) {
+    return new Promise(function(resolve, reject) {
+      var options = {
+        hostname: hostname, port: 443, path: pathname, method: 'POST',
+        headers: Object.assign({}, headers, { 'Content-Length': Buffer.byteLength(body) }),
+      };
+      var req = https.request(options, resolve);
+      req.on('error', reject);
+      req.setTimeout(60000, function() { req.destroy(); reject(new Error('Request timeout')); });
+      req.write(body);
+      req.end();
     });
   }
 }

@@ -19,8 +19,8 @@ describe('OAuthManager', () => {
     // Use a temporary directory for testing
     testTokenPath = path.join(__dirname, '.test-tokens', 'tokens.json');
     OAuthManager.tokenPath = testTokenPath;
-    OAuthManager.cachedToken = null;
-    OAuthManager.refreshPromise = null;
+    // OAuthManager.cachedToken = null; // Removed in new implementation
+    OAuthManager.refreshPromises = new Map();
 
     // Clean up test directory
     const testDir = path.dirname(testTokenPath);
@@ -107,7 +107,10 @@ describe('OAuthManager', () => {
       OAuthManager.saveTokens(tokens);
 
       const loaded = OAuthManager.loadTokens();
-      expect(loaded).toEqual(tokens);
+      // Expect multi-account format
+      expect(loaded.accounts).toHaveLength(1);
+      expect(loaded.accounts[0]).toMatchObject(tokens);
+      expect(loaded.active_index).toBe(0);
     });
 
     it('should create directory if it does not exist', () => {
@@ -210,7 +213,7 @@ describe('OAuthManager', () => {
   });
 
   describe('logout', () => {
-    it('should delete token file and clear cached token', () => {
+    it('should delete token file', () => {
       const tokens = {
         access_token: 'test-access-token',
         refresh_token: 'test-refresh-token',
@@ -218,15 +221,12 @@ describe('OAuthManager', () => {
       };
 
       OAuthManager.saveTokens(tokens);
-      OAuthManager.cachedToken = 'cached-token';
-
+      
       expect(fs.existsSync(testTokenPath)).toBe(true);
-      expect(OAuthManager.cachedToken).toBe('cached-token');
 
       OAuthManager.logout();
 
       expect(fs.existsSync(testTokenPath)).toBe(false);
-      expect(OAuthManager.cachedToken).toBeNull();
     });
 
     it('should not throw error if token file does not exist', () => {
@@ -295,9 +295,9 @@ describe('OAuthManager', () => {
       await OAuthManager.refreshAccessToken();
 
       const updatedTokens = OAuthManager.loadTokens();
-      expect(updatedTokens.access_token).toBe('new-access-token');
-      expect(updatedTokens.refresh_token).toBe('new-refresh-token');
-      expect(updatedTokens.expires_at).toBeGreaterThan(Date.now());
+      expect(updatedTokens.accounts[0].access_token).toBe('new-access-token');
+      expect(updatedTokens.accounts[0].refresh_token).toBe('new-refresh-token');
+      expect(updatedTokens.accounts[0].expires_at).toBeGreaterThan(Date.now());
     });
 
     it('should prevent concurrent refresh attempts', async () => {
@@ -329,14 +329,14 @@ describe('OAuthManager', () => {
         OAuthManager.refreshAccessToken()
       ]);
 
-      // Both should succeed but only one request should be made
-      expect(result1).toEqual(mockResponse);
-      expect(result2).toEqual(mockResponse);
+      // refreshAccountToken returns just the access_token string
+      expect(result1).toBe('new-token');
+      expect(result2).toBe('new-token');
       expect(requestCount).toBe(1);
     });
 
-    it('should throw error if no refresh token available', async () => {
-      await expect(OAuthManager.refreshAccessToken()).rejects.toThrow('No refresh token available');
+    it('should throw error if no accounts available', async () => {
+      await expect(OAuthManager.refreshAccessToken()).rejects.toThrow('No accounts');
     });
   });
 
@@ -348,10 +348,10 @@ describe('OAuthManager', () => {
         expires_at: Date.now() + 3600000 // 1 hour from now
       };
       OAuthManager.saveTokens(tokens);
-      OAuthManager.cachedToken = 'test-token';
-
-      const token = await OAuthManager.getValidAccessToken();
-      expect(token).toBe('test-token');
+      
+      const result = await OAuthManager.getValidAccessToken();
+      expect(result.token).toBe('test-token');
+      expect(result.accountId).toBeDefined();
     });
 
     it('should refresh token if expired', async () => {
@@ -372,8 +372,8 @@ describe('OAuthManager', () => {
         .post('/v1/oauth/token')
         .reply(200, mockResponse);
 
-      const token = await OAuthManager.getValidAccessToken();
-      expect(token).toBe('new-token');
+      const result = await OAuthManager.getValidAccessToken();
+      expect(result.token).toBe('new-token');
     });
 
     it('should refresh token if expiring soon (within 1 minute)', async () => {
@@ -394,8 +394,8 @@ describe('OAuthManager', () => {
         .post('/v1/oauth/token')
         .reply(200, mockResponse);
 
-      const token = await OAuthManager.getValidAccessToken();
-      expect(token).toBe('new-token');
+      const result = await OAuthManager.getValidAccessToken();
+      expect(result.token).toBe('new-token');
     });
 
     it('should throw error if no tokens exist', async () => {
