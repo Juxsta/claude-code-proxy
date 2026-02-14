@@ -331,8 +331,8 @@ function startServer() {
     Logger.info('');
     Logger.info('Backends:');
     const allBackends = registry.getAllBackends();
-    for (const info of allBackends) {
-      Logger.info("  " + info.id + ": priority=" + info.priority + " status=" + info.status);
+    for (const [name, info] of Object.entries(allBackends)) {
+      Logger.info("  " + name + ": enabled=" + info.enabled + " priority=" + info.priority + " healthy=" + info.healthy);
     }
     Logger.info('');
   });
