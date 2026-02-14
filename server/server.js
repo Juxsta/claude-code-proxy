@@ -331,7 +331,7 @@ function startServer() {
       }
     }
     const geminiBackend = registry.getBackend('gemini');
-    Logger.info('  Gemini: ' + (geminiBackend && geminiBackend.backend && typeof geminiBackend.backend.isHealthy === "function" && geminiBackend.backend.isHealthy() ? 'authenticated' : 'not configured'));
+    Logger.info("  Gemini: " + (geminiBackend && typeof geminiBackend.isHealthy === "function" && geminiBackend.isHealthy() ? "authenticated" : "not configured"));
     Logger.info('');
     Logger.info('Backends:');
     const allBackends = registry.getAllBackends();

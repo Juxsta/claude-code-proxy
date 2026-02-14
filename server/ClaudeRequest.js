@@ -381,6 +381,11 @@ class ClaudeRequest {
               Logger.warn('Token rotation failed: ' + rotateError.message);
             }
           }
+          // If permission error (403), throw so router can fallback to next backend
+          if (claudeResponse.statusCode === 403) {
+            Logger.warn('Anthropic permission error, throwing for backend fallback');
+            throw new Error('Anthropic permission error: ' + errorBody);
+          }
           // Return the already-read body
           res.statusCode = claudeResponse.statusCode;
           Object.keys(claudeResponse.headers).forEach(key => { res.setHeader(key, claudeResponse.headers[key]); });
@@ -397,9 +402,17 @@ class ClaudeRequest {
       this.streamResponse(res, claudeResponse);
 
     } catch (error) {
+      // Let permission errors propagate to the router for backend fallback
+      if (error.message && error.message.includes('permission error')) {
+        throw error;
+      }
       console.error('Claude request error:', error.message);
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: error.message }));
+      if (!res.headersSent) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+      }
+      if (!res.destroyed) {
+        res.end(JSON.stringify({ error: error.message }));
+      }
     }
   }
 

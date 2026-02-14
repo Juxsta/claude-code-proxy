@@ -7,8 +7,8 @@ const { translateRequest, translateResponse, StreamTranslator, mapModelToGemini 
 
 const CODE_ASSIST_ENDPOINT = 'https://cloudcode-pa.googleapis.com';
 const CODE_ASSIST_API_VERSION = 'v1internal';
-const OAUTH_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || 'your-client-id';
-const OAUTH_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || 'your-client-secret';
+const OAUTH_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
+const OAUTH_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || '';
 
 const RATE_LIMIT_CODES = [429, 503];
 const AUTO_SWITCH_MAP = { 'gemini-2.5-pro': 'gemini-2.5-flash', 'gemini-2.5-flash': 'gemini-2.5-flash-lite' };
@@ -84,13 +84,10 @@ class GeminiBackend {
     if (this.projectId) return this.projectId;
 
     var token = await this._getAccessToken();
-    var initialProject = 'default-project';
 
     try {
-      var loadResp = await this._callEndpoint(token, 'loadCodeAssist', {
-        cloudaicompanionProject: initialProject,
-        metadata: { duetProject: initialProject },
-      });
+      // Send empty body to let the API return the user's assigned project
+      var loadResp = await this._callEndpoint(token, 'loadCodeAssist', {});
       var loadParsed = JSON.parse(loadResp.body);
 
       if (loadParsed.cloudaicompanionProject) {
@@ -99,32 +96,34 @@ class GeminiBackend {
         return this.projectId;
       }
 
+      // No project assigned - try onboarding with default tier
       var defaultTier = (loadParsed.allowedTiers || []).find(function(t) { return t.isDefault; });
       var tierId = (defaultTier && defaultTier.id) || 'free-tier';
 
+      var lroResp = await this._callEndpoint(token, 'onboardUser', {
+        tierId: tierId,
+      });
+      var lro = JSON.parse(lroResp.body);
+
+      // Poll for completion
       var retries = 0;
-      var lroResp;
-      while (retries < 30) {
-        lroResp = await this._callEndpoint(token, 'onboardUser', {
-          tierId: tierId,
-          cloudaicompanionProject: initialProject,
-        });
-        var lro = JSON.parse(lroResp.body);
-        if (lro.done) {
-          this.projectId = (lro.response && lro.response.cloudaicompanionProject && lro.response.cloudaicompanionProject.id) || initialProject;
-          Logger.info('Gemini project onboarded: ' + this.projectId);
-          return this.projectId;
-        }
-        await new Promise(function(r) { setTimeout(r, 1000); });
+      while (!lro.done && retries < 30) {
+        await new Promise(function(r) { setTimeout(r, 5000); });
+        var opResp = await this._callEndpoint(token, 'operations/' + lro.name, {});
+        lro = JSON.parse(opResp.body);
         retries++;
       }
 
-      this.projectId = initialProject;
-      return this.projectId;
+      if (lro.done && lro.response && lro.response.cloudaicompanionProject) {
+        this.projectId = lro.response.cloudaicompanionProject.id || lro.response.cloudaicompanionProject;
+        Logger.info('Gemini project onboarded: ' + this.projectId);
+        return this.projectId;
+      }
+
+      throw new Error('Could not discover project ID');
     } catch (e) {
       Logger.error('Project discovery failed: ' + e.message);
-      this.projectId = 'default-project';
-      return this.projectId;
+      throw e;
     }
   }
 
@@ -188,7 +187,7 @@ class GeminiBackend {
   async _handleNonStreaming(res, token, geminiPayload, model) {
     var endpointUrl = CODE_ASSIST_ENDPOINT + '/' + CODE_ASSIST_API_VERSION + ':generateContent';
     var urlObj = new URL(endpointUrl);
-    var requestBody = JSON.stringify(geminiPayload.request);
+    var requestBody = JSON.stringify({ model: geminiPayload.model, project: this.projectId, request: geminiPayload.request });
 
     var response = await this._httpsPostRaw(urlObj.hostname, urlObj.pathname, requestBody, {
       'Content-Type': 'application/json',
@@ -222,7 +221,9 @@ class GeminiBackend {
       return;
     }
 
-    var geminiResponse = JSON.parse(response.body);
+    var rawResponse = JSON.parse(response.body);
+    // Cloud Code Assist wraps response in { response: { candidates: [...] } }
+    var geminiResponse = rawResponse.response || rawResponse;
     var anthropicResponse = translateResponse(geminiResponse, model);
 
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -232,7 +233,7 @@ class GeminiBackend {
   async _handleStreaming(res, token, geminiPayload, model) {
     var endpointUrl = CODE_ASSIST_ENDPOINT + '/' + CODE_ASSIST_API_VERSION + ':streamGenerateContent?alt=sse';
     var urlObj = new URL(endpointUrl);
-    var requestBody = JSON.stringify(geminiPayload.request);
+    var requestBody = JSON.stringify({ model: geminiPayload.model, project: this.projectId, request: geminiPayload.request });
 
     var headers = {
       'Content-Type': 'application/json',

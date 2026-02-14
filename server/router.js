@@ -102,6 +102,28 @@ class Router {
       }
     }
 
+    // All model-specific backends failed - try any healthy backend as cross-model fallback
+    if (!res.headersSent) {
+      var allBackends = this.registry.getAllBackendsForModel('auto');
+      var tried = backends.map(function(b) { return b.id; });
+      for (var j = 0; j < allBackends.length; j++) {
+        var fallbackEntry = allBackends[j];
+        if (tried.indexOf(fallbackEntry.id) !== -1) continue;
+        if (!fallbackEntry.backend.isHealthy()) continue;
+        try {
+          Logger.info('Cross-model fallback to: ' + fallbackEntry.id);
+          this.registry.incrementRequestCount(fallbackEntry.id);
+          var fallbackBody = Object.assign({}, body);
+          await fallbackEntry.backend.sendRequest(req, res, fallbackBody);
+          this.registry.markHealthy(fallbackEntry.id);
+          return;
+        } catch (fallbackError) {
+          lastError = fallbackError;
+          Logger.warn('Fallback backend ' + fallbackEntry.id + ' also failed: ' + fallbackError.message);
+        }
+      }
+    }
+
     if (!res.headersSent) {
       res.writeHead(503, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({

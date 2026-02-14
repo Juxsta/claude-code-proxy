@@ -1,3 +1,16 @@
+
+var CLAUDE_TO_GEMINI = {
+  'claude-haiku-4-5-20250514': 'gemini-2.5-flash',
+  'claude-sonnet-4-20250514': 'gemini-2.5-pro',
+  'claude-opus-4-20250514': 'gemini-2.5-pro',
+};
+
+function mapModelToGemini(model) {
+  if (!model) return 'gemini-2.5-pro';
+  if (model.startsWith('gemini-')) return model;
+  return CLAUDE_TO_GEMINI[model] || 'gemini-2.5-pro';
+}
+
 /**
  * Translates Anthropic Messages API format to Gemini generateContent format and back.
  */
@@ -298,8 +311,47 @@ function geminiStreamToAnthropicSSE(geminiChunk, state) {
   return events.join('');
 }
 
+
+class StreamTranslator {
+  constructor(model) {
+    this.model = model;
+    this.state = { messageId: 'msg_' + Date.now(), inputTokens: 0, outputTokens: 0, contentIndex: 0, thinkingActive: false };
+  }
+  translateChunk(data) {
+    var sse = geminiStreamToAnthropicSSE(data, this.state);
+    var events = [];
+    var lines = sse.split('\n');
+    var currentEvent = null;
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i].trim();
+      if (line.startsWith('event: ')) {
+        currentEvent = line.substring(7);
+      } else if (line.startsWith('data: ') && currentEvent) {
+        try {
+          events.push({ event: currentEvent, data: JSON.parse(line.substring(6)) });
+        } catch (e) { /* skip */ }
+        currentEvent = null;
+      }
+    }
+    return events;
+  }
+  finalize() {
+    return [{
+      event: 'message_delta',
+      data: { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: this.state.outputTokens } }
+    }, {
+      event: 'message_stop',
+      data: { type: 'message_stop' }
+    }];
+  }
+}
+
 module.exports = {
   anthropicToGemini,
   geminiToAnthropic,
-  geminiStreamToAnthropicSSE
+  geminiStreamToAnthropicSSE,
+  translateRequest: function(body, projectId) { return { request: anthropicToGemini(body, { projectId: projectId }) }; },
+  translateResponse: geminiToAnthropic,
+  StreamTranslator: StreamTranslator,
+  mapModelToGemini: mapModelToGemini
 };
